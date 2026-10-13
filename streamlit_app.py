@@ -1,6 +1,8 @@
 import calendar
 import datetime as dt
 import hmac
+import hashlib
+import re
 import html
 import json
 import uuid
@@ -15,11 +17,22 @@ import streamlit as st
 END = dt.date(2027, 12, 31)
 START = dt.date(2020, 1, 1)
 MONTHS = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre']
-SPORTS = ['Salle de sport', 'Course à pied', 'Autre']
-COLORS = {'Salle de sport': '#8154bc', 'Course à pied': '#277cb5', 'Autre': '#ad5b16'}
-SHORT = {'Salle de sport': 'Salle', 'Course à pied': 'Course', 'Autre': 'Autre'}
+# Couleurs de compatibilité pour les séances enregistrées avant cette version.
+LEGACY_COLORS = {'Salle de sport': '#8154bc', 'Course à pied': '#277cb5', 'Autre': '#ad5b16'}
 TODAY = dt.datetime.now(ZoneInfo('Europe/Paris')).date()
 DEFAULT = min(max(TODAY, START), END)
+
+
+def session_color(payload):
+    color = payload.get('color') or LEGACY_COLORS.get(payload.get('type'), '#277cb5')
+    return color.lower() if isinstance(color, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', color) else '#277cb5'
+
+
+def contrast_text(color):
+    rgb = [int(color[i:i+2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= .04045 else ((c + .055) / 1.055) ** 2.4 for c in rgb]
+    luminance = sum(c * w for c, w in zip(linear, [.2126, .7152, .0722]))
+    return '#111827' if luminance > .179 else '#ffffff'
 
 
 def month_shift(month, step):
@@ -122,9 +135,6 @@ h2 {font-size:1.2rem!important;}
 [class*="st-key-datebutton_today_"] button {background:#dbeafe;color:#144e82;}
 [class*="st-key-event_"] button {border-left:4px solid!important;}
 [class*="st-key-event_"] button p {font-size:11px!important;line-height:1.25!important;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
-[class*="st-key-event_salle_"] button {background:#eee5f8;color:#613390;border-color:#8154bc!important;}
-[class*="st-key-event_course_"] button {background:#ddecf9;color:#145883;border-color:#277cb5!important;}
-[class*="st-key-event_autre_"] button {background:#fff0de;color:#8e4610;border-color:#ad5b16!important;}
 [class*="st-key-event_yes_"] button {background:#dff2e5;color:#12642e;border-color:#15803d!important;}
 [class*="st-key-event_no_"] button {background:#fbe4e4;color:#982626;border-color:#b91c1c!important;}
 .weekday {text-align:center;font-size:12px;font-weight:600;background:#e8eff5;color:#28455d;padding:8px 0;border:1px solid #aabdcf;}
@@ -214,7 +224,13 @@ if page == '📅 Agenda':
         st.session_state['month'] = TODAY.replace(day=1)
         select_day(TODAY)
         st.rerun()
-    st.markdown('<div class="legend">🟣 Salle · 🔵 Course · 🟠 Autre · ✓ Réalisée<br>Déficit : vert = oui · rouge = non</div>', unsafe_allow_html=True)
+    month_sessions = [r for r in sessions if r['event_date'].startswith(month.strftime('%Y-%m'))]
+    legend_items = sorted({(r['payload']['type'], session_color(r['payload'])) for r in month_sessions})
+    legend = ' · '.join(
+        f'<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:{color};border:1px solid #94a3b8"></span> {html.escape(title)}'
+        for title, color in legend_items
+    )
+    st.markdown('<div class="legend">' + (legend + '<br>' if legend else '') + '✓ Séance réalisée<br>Déficit : vert = oui · rouge = non</div>', unsafe_allow_html=True)
     with st.container(key='calgrid'):
         full_days = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
         short_days = ['Lun.', 'Mar.', 'Mer.', 'Jeu.', 'Ven.', 'Sam.', 'Dim.']
@@ -234,9 +250,14 @@ if page == '📅 Agenda':
                             events = [r for r in sessions if r['event_date'] == day.isoformat()]
                             for event in events[:3]:
                                 p = event['payload']
-                                color_name = {'Salle de sport':'salle', 'Course à pied':'course'}.get(p['type'], 'autre')
-                                label = SHORT.get(p['type'], 'Autre') + (' ✓' if p.get('done') else '')
-                                with st.container(key='event_' + color_name + '_' + event['id']):
+                                color = session_color(p)
+                                container_key = 'event_custom_' + hashlib.sha256(event['id'].encode()).hexdigest()[:16]
+                                st.markdown(
+                                    f'<style>.st-key-{container_key} button {{background:{color};color:{contrast_text(color)};border-color:{color}!important;}}</style>',
+                                    unsafe_allow_html=True
+                                )
+                                label = p['type'] + (' ✓' if p.get('done') else '')
+                                with st.container(key=container_key):
                                     st.button(label, key='calendar_event_' + event['id'],
                                               help=p.get('details') or 'Ouvrir la séance',
                                               on_click=open_session, args=(event['id'], day))
@@ -277,14 +298,17 @@ if page == '📅 Agenda':
             with st.form('edit_' + editing['id']):
                 event_date = st.date_input('Date de la séance', dt.date.fromisoformat(editing['event_date']),
                                            min_value=START, max_value=END, format='DD/MM/YYYY', key='edit_date_' + editing['id'])
-                sport_type = st.selectbox('Activité', SPORTS, index=SPORTS.index(p['type']))
+                sport_type = st.text_input('Intitulé de la séance', value=p['type'], max_chars=80, key='edit_title_' + editing['id'])
+                color = st.color_picker('Couleur dans le calendrier', value=session_color(p), key='edit_color_' + editing['id'])
                 details = st.text_input('Séance / objectif', value=p.get('details', ''))
                 done = st.checkbox('Séance réalisée ✓', value=p.get('done', False))
                 duration = st.number_input('Durée (minutes)', min_value=0, value=int(p.get('duration', 0)))
                 km = st.number_input('Distance (km, si utile)', min_value=0.0, value=float(p.get('km', 0)), step=.1)
                 notes = st.text_area('Exercices, séries, poids soulevés et commentaires', value=p.get('notes', ''))
                 if st.form_submit_button('Enregistrer les modifications'):
-                    if save_record(editing['id'], 'sport', event_date, {'type': sport_type, 'details': details, 'done': done, 'duration': duration, 'km': km, 'notes': notes}):
+                    if not sport_type.strip():
+                        st.info('Ajoute un intitulé pour ta séance.')
+                    elif save_record(editing['id'], 'sport', event_date, {'type': sport_type.strip(), 'color': color, 'details': details, 'done': done, 'duration': duration, 'km': km, 'notes': notes}):
                         st.session_state['month'] = event_date.replace(day=1)
                         st.session_state['selected_day'] = event_date
                         st.rerun()
@@ -303,11 +327,14 @@ if page == '📅 Agenda':
     with st.expander('➕ Programmer une séance'):
         with st.form('add_sport_' + selected.isoformat()):
             date = st.date_input('Date de la séance', selected, min_value=START, max_value=END, format='DD/MM/YYYY')
-            sport_type = st.selectbox('Activité', SPORTS)
+            sport_type = st.text_input('Intitulé de la séance', placeholder='Ex. Pilates, natation, randonnée…', max_chars=80, key='new_title')
+            color = st.color_picker('Couleur dans le calendrier', value='#277cb5', key='new_color')
             details = st.text_input('Séance / objectif')
             notes = st.text_area('Commentaires')
             if st.form_submit_button('Programmer'):
-                if save_record(str(uuid.uuid4()), 'sport', date, {'type': sport_type, 'details': details, 'done': False, 'duration': 0, 'km': 0.0, 'notes': notes}):
+                if not sport_type.strip():
+                    st.info('Ajoute un intitulé pour ta séance.')
+                elif save_record(str(uuid.uuid4()), 'sport', date, {'type': sport_type.strip(), 'color': color, 'details': details, 'done': False, 'duration': 0, 'km': 0.0, 'notes': notes}):
                     st.session_state['month'] = date.replace(day=1)
                     st.session_state['selected_day'] = date
                     st.rerun()
